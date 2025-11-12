@@ -89,13 +89,19 @@ echo "📥 Step 3: Creating project files..."
 echo "   Creating vpcctl..."
 cat > vpcctl << 'VPCCTL_EOF'
 #!/usr/bin/env python3
-
 """
 vpcctl - Virtual Private Cloud Control Tool
-A CLI tool to create, manage, and tear down virtual VPCs on Linux using
-network namespaces, bridges, veth pairs, and iptables.
+A complete implementation of VPC functionality using Linux networking primitives
 
-Author: Ubah Delight Godson
+This tool allows you to:
+- Create isolated virtual private clouds (VPCs)
+- Manage public and private subnets
+- Configure NAT gateways for internet access
+- Establish VPC peering connections
+- Apply firewall policies (security groups)
+- Deploy and test applications
+
+Author: Ubah Delight Okechukwu
 Date: November 2025
 """
 
@@ -131,7 +137,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Print banner
 print("=" * 80)
 print("  VPCCTL - Virtual Private Cloud Control Tool")
 print("  Building VPCs from Linux Networking Primitives")
@@ -140,7 +145,12 @@ logger.info("vpcctl started")
 
 
 class VPCState:
-    """Manages VPC state persistence"""
+    """
+    Manages VPC state persistence to disk
+    
+    State is stored in JSON format at ~/.vpcctl/vpc_state.json
+    This allows VPC configurations to persist across reboots
+    """
     
     def __init__(self):
         self.state = self.load()
@@ -188,13 +198,18 @@ class VPCState:
 
 
 class NetworkManager:
-    """Handles low-level Linux networking operations"""
+    """
+    Handles low-level Linux networking operations
+    
+    This class wraps Linux networking commands (ip, iptables)
+    and provides a clean interface for VPC operations
+    """
     
     @staticmethod
     def run_command(cmd, check=True, capture=True):
-        """Execute shell command"""
+        """Execute shell command with error handling"""
         cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
-        logger.debug(f"Executing: {cmd_str}")
+        logger.info(f"Executing: {cmd_str}")
         try:
             if capture:
                 result = subprocess.run(cmd, check=check, capture_output=True, text=True)
@@ -214,7 +229,7 @@ class NetworkManager:
     
     @staticmethod
     def create_namespace(ns_name):
-        """Create network namespace"""
+        """Create network namespace (isolated network environment)"""
         logger.info(f"Creating namespace: {ns_name}")
         NetworkManager.run_command(["ip", "netns", "add", ns_name])
         print(f"  ✓ Created namespace: {ns_name}")
@@ -227,16 +242,8 @@ class NetworkManager:
         print(f"  ✓ Deleted namespace: {ns_name}")
     
     @staticmethod
-    def namespace_exists(ns_name):
-        """Check if namespace exists"""
-        result = NetworkManager.run_command(["ip", "netns", "list"], check=False)
-        if result:
-            return ns_name in result.stdout
-        return False
-    
-    @staticmethod
     def create_bridge(bridge_name):
-        """Create Linux bridge"""
+        """Create Linux bridge (acts as virtual switch/router)"""
         logger.info(f"Creating bridge: {bridge_name}")
         NetworkManager.run_command(["ip", "link", "add", bridge_name, "type", "bridge"])
         NetworkManager.run_command(["ip", "link", "set", bridge_name, "up"])
@@ -252,7 +259,7 @@ class NetworkManager:
     
     @staticmethod
     def create_veth_pair(veth_name, peer_name):
-        """Create veth pair"""
+        """Create veth pair (virtual ethernet cable)"""
         logger.info(f"Creating veth pair: {veth_name} <-> {peer_name}")
         NetworkManager.run_command(["ip", "link", "add", veth_name, "type", "veth", "peer", "name", peer_name])
         print(f"  ✓ Created veth pair: {veth_name} <-> {peer_name}")
@@ -265,14 +272,14 @@ class NetworkManager:
     
     @staticmethod
     def attach_to_bridge(interface, bridge):
-        """Attach interface to bridge"""
+        """Attach network interface to bridge"""
         logger.info(f"Attaching {interface} to bridge {bridge}")
         NetworkManager.run_command(["ip", "link", "set", interface, "master", bridge])
         NetworkManager.run_command(["ip", "link", "set", interface, "up"])
     
     @staticmethod
     def move_to_namespace(interface, namespace):
-        """Move interface to namespace"""
+        """Move network interface to namespace"""
         logger.info(f"Moving {interface} to namespace {namespace}")
         NetworkManager.run_command(["ip", "link", "set", interface, "netns", namespace])
     
@@ -291,23 +298,43 @@ class NetworkManager:
         NetworkManager.run_command(["ip", "netns", "exec", namespace, "ip", "route", "add", destination, "via", gateway])
     
     @staticmethod
+    def add_host_route(destination, via_bridge):
+        """Add route on host (for VPC peering)"""
+        logger.info(f"Adding host route: {destination} dev {via_bridge}")
+        # Check if route already exists
+        result = NetworkManager.run_command(["ip", "route", "show", destination], check=False)
+        if result and destination in result.stdout:
+            logger.info(f"Route to {destination} already exists, skipping")
+            return
+        NetworkManager.run_command(["ip", "route", "add", destination, "dev", via_bridge])
+    
+    @staticmethod
+    def delete_host_route(destination):
+        """Delete route from host"""
+        logger.info(f"Deleting host route: {destination}")
+        NetworkManager.run_command(["ip", "route", "del", destination], check=False)
+    
+    @staticmethod
     def enable_ip_forward():
-        """Enable IP forwarding"""
+        """Enable IP forwarding (required for routing between networks)"""
         logger.info("Enabling IP forwarding")
         NetworkManager.run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"], capture=False)
     
     @staticmethod
     def setup_nat(bridge_name, subnet_cidr, out_interface):
-        """Setup NAT for outbound traffic"""
+        """
+        Setup NAT (Network Address Translation) for internet access
+        This allows private IPs to access the internet through the host
+        """
         logger.info(f"Setting up NAT for {subnet_cidr} via {out_interface}")
         
-        # MASQUERADE rule for outbound traffic
+        # MASQUERADE rule - translates private IPs to host's public IP
         NetworkManager.run_command([
             "iptables", "-t", "nat", "-A", "POSTROUTING",
             "-s", subnet_cidr, "-o", out_interface, "-j", "MASQUERADE"
         ])
         
-        # Forward rules
+        # Forward rules - allow traffic through the host
         NetworkManager.run_command([
             "iptables", "-A", "FORWARD", "-i", bridge_name,
             "-o", out_interface, "-j", "ACCEPT"
@@ -352,14 +379,26 @@ class NetworkManager:
 
 
 class VPCManager:
-    """High-level VPC management operations"""
+    """
+    High-level VPC management operations
+    
+    This class orchestrates all VPC operations by using NetworkManager
+    for low-level networking and VPCState for persistence
+    """
     
     def __init__(self):
         self.state = VPCState()
         self.net = NetworkManager()
     
     def create_vpc(self, vpc_name, cidr_block):
-        """Create a new VPC"""
+        """
+        Create a new VPC
+        
+        A VPC is implemented as:
+        - A Linux bridge (acts as the VPC router)
+        - IP address space defined by CIDR block
+        - Isolated from other VPCs by default
+        """
         print(f"\n{'='*80}")
         print(f"CREATING VPC: {vpc_name}")
         print(f"{'='*80}")
@@ -385,7 +424,7 @@ class VPCManager:
             # Create bridge
             self.net.create_bridge(bridge_name)
             
-            # Assign bridge IP (first usable IP in range)
+            # Assign bridge IP (first usable IP in VPC range)
             bridge_ip = str(list(network.hosts())[0])
             self.net.run_command(["ip", "addr", "add", f"{bridge_ip}/{network.prefixlen}", "dev", bridge_name])
             print(f"  ✓ Assigned bridge IP: {bridge_ip}/{network.prefixlen}")
@@ -416,12 +455,19 @@ class VPCManager:
         except Exception as e:
             print(f"❌ Error: Failed to create VPC: {e}")
             logger.error(f"Failed to create VPC: {e}")
-            # Cleanup on failure
             self.net.delete_bridge(bridge_name)
             return False
     
     def add_subnet(self, vpc_name, subnet_name, subnet_cidr, subnet_type="private"):
-        """Add subnet to VPC"""
+        """
+        Add subnet to VPC
+        
+        Subnet implementation:
+        - Network namespace (isolated network environment)
+        - veth pair connects namespace to VPC bridge
+        - Public subnets have NAT for internet access
+        - Private subnets are isolated from internet
+        """
         print(f"\n{'='*80}")
         print(f"ADDING SUBNET: {subnet_name} to VPC: {vpc_name}")
         print(f"{'='*80}")
@@ -447,10 +493,10 @@ class VPCManager:
             logger.error(f"Invalid CIDR: {e}")
             return False
         
-        # Check if subnet already exists
+        # Check if subnet exists
         if subnet_name in vpc["subnets"]:
-            print(f"❌ Error: Subnet '{subnet_name}' already exists in VPC '{vpc_name}'")
-            logger.error(f"Subnet {subnet_name} already exists in VPC {vpc_name}")
+            print(f"❌ Error: Subnet '{subnet_name}' already exists")
+            logger.error(f"Subnet {subnet_name} already exists")
             return False
         
         namespace = f"ns-{vpc_name}-{subnet_name}"
@@ -471,17 +517,16 @@ class VPCManager:
             # Move namespace side to namespace
             self.net.move_to_namespace(veth_ns, namespace)
             
-            # Assign IP to namespace interface (use second host IP)
+            # Assign IPs: Bridge gets first IP, namespace gets second IP
+            bridge_subnet_ip = str(list(subnet_network.hosts())[0])
+            self.net.run_command(["ip", "addr", "add", f"{bridge_subnet_ip}/{subnet_network.prefixlen}", "dev", vpc["bridge"]])
+            print(f"  ✓ Assigned {bridge_subnet_ip} to bridge on subnet {subnet_cidr}")
+            
             subnet_ip = str(list(subnet_network.hosts())[1])
             self.net.set_ip_address(namespace, veth_ns, f"{subnet_ip}/{subnet_network.prefixlen}")
             print(f"  ✓ Assigned IP {subnet_ip} to {namespace}")
             
-            # Assign bridge interface IP on this subnet (first host IP)
-            bridge_subnet_ip = str(list(subnet_network.hosts())[0])
-            self.net.run_command(["ip", "addr", "add", f"{bridge_subnet_ip}/{subnet_network.prefixlen}", "dev", vpc["bridge"]])
-            print(f"  ✓ Assigned {bridge_subnet_ip} to bridge on this subnet")
-            
-            # Add default route via bridge IP on THIS subnet
+            # Default route via bridge IP on this subnet
             self.net.add_route(namespace, "default", bridge_subnet_ip)
             print(f"  ✓ Added default route via {bridge_subnet_ip}")
             
@@ -500,6 +545,7 @@ class VPCManager:
                 "veth_host": veth_host,
                 "veth_ns": veth_ns,
                 "ip": subnet_ip,
+                "bridge_ip": bridge_subnet_ip,
                 "out_interface": out_interface,
                 "created_at": datetime.now().isoformat()
             }
@@ -510,9 +556,10 @@ class VPCManager:
             print(f"   CIDR: {subnet_cidr}")
             print(f"   Type: {subnet_type}")
             print(f"   IP Address: {subnet_ip}")
+            print(f"   Gateway: {bridge_subnet_ip}")
             print(f"   Namespace: {namespace}")
             if subnet_type == "public":
-                print(f"   NAT Gateway: Enabled via {out_interface}")
+                print(f"   NAT: Enabled via {out_interface}")
             
             logger.info(f"Subnet {subnet_name} added successfully")
             return True
@@ -520,7 +567,6 @@ class VPCManager:
         except Exception as e:
             print(f"❌ Error: Failed to add subnet: {e}")
             logger.error(f"Failed to add subnet: {e}")
-            # Cleanup
             self.net.delete_namespace(namespace)
             self.net.delete_veth(veth_host)
             return False
@@ -538,13 +584,13 @@ class VPCManager:
             return False
         
         if subnet_name not in vpc["subnets"]:
-            print(f"❌ Error: Subnet '{subnet_name}' not found in VPC '{vpc_name}'")
+            print(f"❌ Error: Subnet '{subnet_name}' not found")
             return False
         
         subnet = vpc["subnets"][subnet_name]
         
         try:
-            # Remove NAT rules if public subnet
+            # Remove NAT if public
             if subnet["type"] == "public" and subnet.get("out_interface"):
                 self.net.remove_nat(subnet["cidr"], subnet["out_interface"])
             
@@ -563,7 +609,7 @@ class VPCManager:
             return True
             
         except Exception as e:
-            print(f"❌ Error: Failed to delete subnet: {e}")
+            print(f"❌ Error: {e}")
             logger.error(f"Failed to delete subnet: {e}")
             return False
     
@@ -582,25 +628,23 @@ class VPCManager:
         
         try:
             # Delete all subnets
-            subnet_names = list(vpc["subnets"].keys())
-            for subnet_name in subnet_names:
-                subnet = vpc["subnets"][subnet_name]
+            for subnet_name, subnet in list(vpc["subnets"].items()):
                 logger.info(f"Deleting subnet {subnet_name}")
                 
-                # Remove NAT rules if public subnet
                 if subnet["type"] == "public" and subnet.get("out_interface"):
                     self.net.remove_nat(subnet["cidr"], subnet["out_interface"])
                 
-                # Delete namespace
                 self.net.delete_namespace(subnet["namespace"])
-                
-                # Delete veth
                 self.net.delete_veth(subnet["veth_host"])
             
-            # Delete peering connections
+            # Delete peerings
             for peering in vpc.get("peerings", []):
-                logger.info(f"Removing peering: {peering}")
+                logger.info(f"Removing peering with {peering.get('peer_vpc')}")
                 self.net.delete_veth(peering.get("veth_local", ""))
+                # Remove host routes
+                peer_vpc = self.state.get_vpc(peering.get("peer_vpc", ""))
+                if peer_vpc:
+                    self.net.delete_host_route(peer_vpc["cidr_block"])
                 print(f"  ✓ Removed peering with {peering.get('peer_vpc')}")
             
             # Delete bridge
@@ -619,7 +663,14 @@ class VPCManager:
             return False
     
     def peer_vpcs(self, vpc1_name, vpc2_name):
-        """Create peering connection between two VPCs"""
+        """
+        Create VPC peering connection
+        
+        Peering implementation:
+        - veth pair connects the two VPC bridges
+        - Host routes direct traffic between VPCs
+        - Allows controlled communication between isolated VPCs
+        """
         print(f"\n{'='*80}")
         print(f"CREATING VPC PEERING: {vpc1_name} <-> {vpc2_name}")
         print(f"{'='*80}")
@@ -645,7 +696,8 @@ class VPCManager:
         # Check if peering already exists
         for peering in vpc1.get("peerings", []):
             if peering.get("peer_vpc") == vpc2_name:
-                print(f"❌ Error: Peering already exists between {vpc1_name} and {vpc2_name}")
+                print(f"❌ Error: Peering already exists")
+                logger.error("Peering already exists")
                 return False
         
         veth1 = f"peer-{vpc1_name}-{vpc2_name}"
@@ -655,14 +707,14 @@ class VPCManager:
             # Create veth pair
             self.net.create_veth_pair(veth1, veth2)
             
-            # Attach to respective bridges
+            # Attach to bridges
             self.net.attach_to_bridge(veth1, vpc1["bridge"])
             self.net.attach_to_bridge(veth2, vpc2["bridge"])
             print(f"  ✓ Attached veth pair to bridges")
             
-            # Add routes on host
-            self.net.run_command(["ip", "route", "add", vpc2["cidr_block"], "dev", vpc1["bridge"]])
-            self.net.run_command(["ip", "route", "add", vpc1["cidr_block"], "dev", vpc2["bridge"]])
+            # Add host routes (with existence check)
+            self.net.add_host_route(vpc2["cidr_block"], vpc1["bridge"])
+            self.net.add_host_route(vpc1["cidr_block"], vpc2["bridge"])
             print(f"  ✓ Added routing entries")
             
             # Update state
@@ -687,7 +739,7 @@ class VPCManager:
             
             print(f"\n✅ VPC peering established successfully!")
             print(f"   {vpc1_name} ({vpc1['cidr_block']}) <-> {vpc2_name} ({vpc2['cidr_block']})")
-            logger.info(f"VPC peering established between {vpc1_name} and {vpc2_name}")
+            logger.info(f"Peering established between {vpc1_name} and {vpc2_name}")
             return True
             
         except Exception as e:
@@ -718,7 +770,7 @@ class VPCManager:
                 break
         
         if not peering1:
-            print(f"❌ Error: No peering found between {vpc1_name} and {vpc2_name}")
+            print(f"❌ Error: No peering found")
             return False
         
         try:
@@ -726,9 +778,9 @@ class VPCManager:
             self.net.delete_veth(peering1["veth_local"])
             print(f"  ✓ Deleted veth pair")
             
-            # Remove routes
-            self.net.run_command(["ip", "route", "del", vpc2["cidr_block"], "dev", vpc1["bridge"]], check=False)
-            self.net.run_command(["ip", "route", "del", vpc1["cidr_block"], "dev", vpc2["bridge"]], check=False)
+            # Remove host routes
+            self.net.delete_host_route(vpc2["cidr_block"])
+            self.net.delete_host_route(vpc1["cidr_block"])
             print(f"  ✓ Removed routing entries")
             
             # Update state
@@ -748,7 +800,11 @@ class VPCManager:
             return False
     
     def apply_security_group(self, vpc_name, subnet_name, policy_file):
-        """Apply security group rules from JSON policy"""
+        """
+        Apply security group rules from JSON policy file
+        
+        Security groups control inbound/outbound traffic using iptables
+        """
         print(f"\n{'='*80}")
         print(f"APPLYING SECURITY GROUP")
         print(f"{'='*80}")
@@ -757,13 +813,11 @@ class VPCManager:
         vpc = self.state.get_vpc(vpc_name)
         if not vpc:
             print(f"❌ Error: VPC '{vpc_name}' not found")
-            logger.error(f"VPC {vpc_name} not found")
             return False
         
         subnet = vpc["subnets"].get(subnet_name)
         if not subnet:
             print(f"❌ Error: Subnet '{subnet_name}' not found")
-            logger.error(f"Subnet {subnet_name} not found")
             return False
         
         try:
@@ -779,25 +833,22 @@ class VPCManager:
             print(f"\n✅ Security group applied successfully!")
             print(f"   VPC: {vpc_name}")
             print(f"   Subnet: {subnet_name}")
-            print(f"   Rules applied: {len(policy.get('ingress', []))}")
+            print(f"   Rules: {len(policy.get('ingress', []))}")
             logger.info(f"Security group applied to {subnet_name}")
             return True
             
         except FileNotFoundError:
             print(f"❌ Error: Policy file '{policy_file}' not found")
-            logger.error(f"Policy file not found: {policy_file}")
             return False
         except json.JSONDecodeError as e:
-            print(f"❌ Error: Invalid JSON in policy file: {e}")
-            logger.error(f"Invalid JSON: {e}")
+            print(f"❌ Error: Invalid JSON: {e}")
             return False
         except Exception as e:
             print(f"❌ Error: Failed to apply security group: {e}")
-            logger.error(f"Failed to apply security group: {e}")
             return False
     
     def deploy_app(self, vpc_name, subnet_name, app_type="python", port=8000):
-        """Deploy a simple web server in a subnet"""
+        """Deploy test application in subnet"""
         print(f"\n{'='*80}")
         print(f"DEPLOYING APPLICATION")
         print(f"{'='*80}")
@@ -806,50 +857,49 @@ class VPCManager:
         vpc = self.state.get_vpc(vpc_name)
         if not vpc:
             print(f"❌ Error: VPC '{vpc_name}' not found")
-            logger.error(f"VPC {vpc_name} not found")
             return False
         
         subnet = vpc["subnets"].get(subnet_name)
         if not subnet:
             print(f"❌ Error: Subnet '{subnet_name}' not found")
-            logger.error(f"Subnet {subnet_name} not found")
             return False
         
         namespace = subnet["namespace"]
         
         try:
             if app_type == "python":
-                # Create a simple HTML file to serve
-                html_content = f"""
-                <html>
-                <head><title>VPC Test App</title></head>
-                <body>
-                    <h1>Hello from VPC: {vpc_name}</h1>
-                    <h2>Subnet: {subnet_name}</h2>
-                    <p>IP: {subnet['ip']}</p>
-                    <p>Type: {subnet['type']}</p>
-                    <p>Timestamp: {datetime.now().isoformat()}</p>
-                </body>
-                </html>
-                """
+                # Create HTML content
+                html_content = f"""<!DOCTYPE html>
+<html>
+<head><title>VPC Test App</title></head>
+<body style="font-family: Arial; padding: 40px; background: #f0f0f0;">
+    <h1>✅ VPC Test Application</h1>
+    <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        <h2>VPC: {vpc_name}</h2>
+        <h3>Subnet: {subnet_name}</h3>
+        <p><strong>IP Address:</strong> {subnet['ip']}</p>
+        <p><strong>Subnet Type:</strong> {subnet['type']}</p>
+        <p><strong>CIDR:</strong> {subnet['cidr']}</p>
+        <p><strong>Timestamp:</strong> {datetime.now().isoformat()}</p>
+    </div>
+    <p style="margin-top: 20px; color: #666;">
+        Running in namespace: {namespace}
+    </p>
+</body>
+</html>"""
                 
-                # Create temp directory in namespace
+                # Create temp directory
                 temp_dir = f"/tmp/vpcctl_{namespace}"
                 os.makedirs(temp_dir, exist_ok=True)
                 
                 with open(f"{temp_dir}/index.html", 'w') as f:
                     f.write(html_content)
                 
-                # Start Python HTTP server in background
+                # Start HTTP server in background
                 cmd = f"ip netns exec {namespace} python3 -m http.server {port} --directory {temp_dir} > /dev/null 2>&1 &"
                 subprocess.Popen(cmd, shell=True)
                 
                 print(f"  ✓ Python HTTP server started")
-                
-            elif app_type == "nginx":
-                print(f"  ℹ  nginx deployment requires nginx to be installed")
-                print(f"  ℹ  Using Python HTTP server instead")
-                return self.deploy_app(vpc_name, subnet_name, "python", port)
             
             # Update subnet state
             subnet["app"] = {
@@ -876,12 +926,13 @@ class VPCManager:
             return False
     
     def list_vpcs(self):
-        """List all VPCs"""
+        """List all VPCs with details"""
         vpcs = self.state.list_vpcs()
         
         if not vpcs:
             print("\n📋 No VPCs found")
-            print("   Create your first VPC with: sudo vpcctl create-vpc --name myvpc --cidr 10.0.0.0/16")
+            print("   Create your first VPC with:")
+            print("   sudo ./vpcctl create-vpc --name myvpc --cidr 10.0.0.0/16")
             return
         
         print(f"\n{'='*80}")
@@ -897,9 +948,9 @@ class VPCManager:
             print(f"   Subnets: {len(vpc['subnets'])}")
             
             if vpc["subnets"]:
-                for subnet_name, subnet in vpc["subnets"].items():
+                for name, subnet in vpc["subnets"].items():
                     icon = "🌐" if subnet['type'] == 'public' else "🔒"
-                    print(f"      {icon} {subnet_name}")
+                    print(f"      {icon} {name}")
                     print(f"         CIDR: {subnet['cidr']}")
                     print(f"         Type: {subnet['type']}")
                     print(f"         IP: {subnet['ip']}")
@@ -936,11 +987,12 @@ class VPCManager:
         
         print(f"\n📊 Subnets ({len(vpc['subnets'])}):")
         if vpc["subnets"]:
-            for subnet_name, subnet in vpc["subnets"].items():
-                print(f"\n  • {subnet_name}")
+            for name, subnet in vpc["subnets"].items():
+                print(f"\n  • {name}")
                 print(f"    CIDR: {subnet['cidr']}")
                 print(f"    Type: {subnet['type']}")
                 print(f"    IP: {subnet['ip']}")
+                print(f"    Gateway: {subnet['bridge_ip']}")
                 print(f"    Namespace: {subnet['namespace']}")
                 print(f"    Veth Pair: {subnet['veth_host']} <-> {subnet['veth_ns']}")
                 if subnet.get('app'):
@@ -953,6 +1005,7 @@ class VPCManager:
             for peering in vpc['peerings']:
                 print(f"  • {peering['peer_vpc']}")
                 print(f"    Veth: {peering['veth_local']} <-> {peering['veth_remote']}")
+                print(f"    Created: {peering['created_at']}")
         else:
             print("    No peerings")
         
@@ -960,34 +1013,36 @@ class VPCManager:
         return True
     
     def get_default_interface(self):
-        """Get default network interface"""
+        """Get default network interface for internet access"""
         try:
             result = self.net.run_command(["ip", "route", "show", "default"])
             if result and result.stdout:
                 parts = result.stdout.split()
                 if "dev" in parts:
-                    idx = parts.index("dev")
-                    return parts[idx + 1]
+                    iface = parts[parts.index("dev") + 1]
+                    logger.info(f"Default interface: {iface}")
+                    return iface
         except:
             pass
         
-        # Try common interface names
-        for iface in ["eth0", "ens33", "enp0s3", "wlan0", "wlp2s0"]:
+        # Fallback to common interface names
+        for iface in ["eth0", "ens33", "enp0s3", "wlan0", "wlp2s0", "ens5"]:
             result = self.net.run_command(["ip", "link", "show", iface], check=False)
             if result and result.returncode == 0:
                 logger.info(f"Using interface: {iface}")
                 return iface
         
-        return "eth0"  # Last resort
+        logger.warning("Could not detect default interface, using eth0")
+        return "eth0"
 
 
 def main():
     """Main CLI entry point"""
     
-    # Check if running as root
+    # Check root privileges
     if os.geteuid() != 0:
         print("\n❌ Error: This script must be run as root")
-        print("   Please run with: sudo vpcctl <command>\n")
+        print("   Please run with: sudo ./vpcctl <command>\n")
         sys.exit(1)
     
     parser = argparse.ArgumentParser(
@@ -996,40 +1051,40 @@ def main():
         epilog="""
 Examples:
   Create VPC:
-    sudo vpcctl create-vpc --name myvpc --cidr 10.0.0.0/16
+    sudo ./vpcctl create-vpc --name myvpc --cidr 10.0.0.0/16
   
   Add public subnet:
-    sudo vpcctl add-subnet --vpc myvpc --name public1 --cidr 10.0.1.0/24 --type public
+    sudo ./vpcctl add-subnet --vpc myvpc --name public1 --cidr 10.0.1.0/24 --type public
   
   Add private subnet:
-    sudo vpcctl add-subnet --vpc myvpc --name private1 --cidr 10.0.2.0/24 --type private
+    sudo ./vpcctl add-subnet --vpc myvpc --name private1 --cidr 10.0.2.0/24 --type private
   
   List VPCs:
-    sudo vpcctl list
+    sudo ./vpcctl list
   
   Show VPC details:
-    sudo vpcctl show-vpc --name myvpc
+    sudo ./vpcctl show-vpc --name myvpc
   
   Peer VPCs:
-    sudo vpcctl peer-vpcs --vpc1 myvpc --vpc2 othervpc
+    sudo ./vpcctl peer-vpcs --vpc1 myvpc --vpc2 othervpc
   
   Unpeer VPCs:
-    sudo vpcctl unpeer-vpcs --vpc1 myvpc --vpc2 othervpc
+    sudo ./vpcctl unpeer-vpcs --vpc1 myvpc --vpc2 othervpc
   
   Apply firewall:
-    sudo vpcctl apply-policy --vpc myvpc --subnet public1 --policy rules.json
+    sudo ./vpcctl apply-policy --vpc myvpc --subnet public1 --policy rules.json
   
   Deploy app:
-    sudo vpcctl deploy-app --vpc myvpc --subnet public1 --port 8000
+    sudo ./vpcctl deploy-app --vpc myvpc --subnet public1 --port 8000
   
   Delete subnet:
-    sudo vpcctl delete-subnet --vpc myvpc --name public1
+    sudo ./vpcctl delete-subnet --vpc myvpc --name public1
   
   Delete VPC:
-    sudo vpcctl delete-vpc --name myvpc
+    sudo ./vpcctl delete-vpc --name myvpc
   
   Cleanup all:
-    sudo vpcctl cleanup-all
+    sudo ./vpcctl cleanup-all
         """
     )
     
@@ -1076,7 +1131,7 @@ Examples:
     deploy_parser = subparsers.add_parser('deploy-app', help='Deploy test application')
     deploy_parser.add_argument('--vpc', required=True, help='VPC name')
     deploy_parser.add_argument('--subnet', required=True, help='Subnet name')
-    deploy_parser.add_argument('--type', default='python', help='App type (python/nginx)')
+    deploy_parser.add_argument('--type', default='python', help='App type (python)')
     deploy_parser.add_argument('--port', type=int, default=8000, help='Port number')
     
     # List VPCs
