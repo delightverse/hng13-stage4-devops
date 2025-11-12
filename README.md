@@ -88,8 +88,7 @@ A Virtual Private Cloud is an isolated virtual network environment where you can
 ```bash
 # Clone the repository
 git clone https://github.com/delightverse/hng13-stage4-devops
-cd vpc-from-scratch
-
+cd <name-of-the-cloned-repository-folder>
 # Install dependencies (Ubuntu/Debian)
 sudo apt update
 sudo apt install -y iproute2 iptables bridge-utils python3
